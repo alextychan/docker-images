@@ -1,0 +1,252 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/baseImageMetadata.sh"
+
+checkContainerRuntime() {
+  CONTAINER_RUNTIME=$(which podman 2>/dev/null) ||
+    CONTAINER_RUNTIME=$(which docker 2>/dev/null) ||
+    {
+      echo "No docker or podman executable found in your PATH"
+      exit 1
+    }
+}
+#
+# Since: November, 2018
+# Author: paramdeep.saini@oracle.com
+# Description: Build script for building RAC container image
+#
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS HEADER.
+#
+# Copyright (c) 2014,2026 Oracle and/or its affiliates.
+#
+
+usage() {
+  cat << EOF
+
+Usage: buildContainerImage.sh -v [version] -t [image_name:tag] [-b] [-o] [-i]
+It builds a container image for a DNS server
+
+Parameters:
+   -v: version to build
+   -i: ignores the MD5 checksums
+   -t: user defined image name and tag (e.g., image_name:tag)
+   -o: passes on container build option (e.g., --build-arg SLIMMIMG=true for slim)
+   -b: build base stage only (Used by extensions)
+
+LICENSE UPL 1.0
+
+Copyright (c) 2014,2026 Oracle and/or its affiliates.
+
+EOF
+  exit 0
+}
+
+# Validate packages (Checksum may contain MD5 or SHA256 digests)
+checksumPackages() {
+  local checksum_file="${VERSION}/Checksum"
+  local hash_algo="md5"
+  local check_cmd="md5sum"
+  local sample_hash
+
+  if [ ! -f "${checksum_file}" ]; then
+    echo "Checksum file ${checksum_file} not found."
+    exit 1
+  fi
+
+  # Detect digest type from first non-comment hash line (64 hex = SHA256, else MD5)
+  sample_hash="$(awk '/^[[:xdigit:]]{32,}/{print $1; exit}' "${checksum_file}")"
+  if [[ "${sample_hash}" =~ ^[[:xdigit:]]{64}$ ]]; then
+    hash_algo="sha256"
+    check_cmd="sha256sum"
+  fi
+
+  if hash "${check_cmd}" 2>/dev/null; then
+    echo "Checking if required packages are present and valid (${hash_algo})..."
+    # shellcheck disable=SC2086
+    ${check_cmd} -c "${checksum_file}"
+    # shellcheck disable=SC2181
+    if [ "$?" -ne 0 ]; then
+      echo "${hash_algo} for required packages to build this image did not match!"
+      echo "Make sure to download missing files in folder $VERSION."
+      # shellcheck disable=SC2320
+      exit $?
+    fi
+  else
+    echo "Ignored checksum, '${check_cmd}' command not available."
+  fi
+}
+
+##############
+#### MAIN ####
+##############
+
+if [ "$#" -eq 0 ]; then
+  usage;
+fi
+
+# Parameters
+VERSION="23.26.0"
+SKIPMD5=0
+BASE_ONLY=0
+DOCKEROPS=""
+IMAGE_NAME=""
+SLIM="false"
+DOCKEROPS=" --build-arg SLIMMING=false"
+
+while getopts "hibv:o:t:" optname; do
+  case "$optname" in
+    "h")
+      usage
+      ;;
+    "i")
+      SKIPMD5=1
+      ;;
+    "v")
+      VERSION="$OPTARG"
+      ;;
+    "b")
+      BASE_ONLY=1
+      SKIPMD5=1
+      ;;
+    "o")
+      DOCKEROPS="$OPTARG"
+      if [[ "$DOCKEROPS" != *"--build-arg SLIMMING="* ]]; then
+         DOCKEROPS+=" --build-arg SLIMMING=false"
+         SLIM="false"
+      fi
+      if [[ "$OPTARG" == *"--build-arg SLIMMING=true"* ]]; then
+        SLIM="true"
+      fi
+      ;;
+    "t")
+      IMAGE_NAME="$OPTARG"
+      ;;
+    "?")
+      usage;
+      ;;
+    *)
+    # Should not occur
+      echo "Unknown error while processing options inside buildContainerImage.sh"
+      ;;
+  esac
+done
+
+# Oracle Database Image Name
+if [ "${BASE_ONLY}" -eq 1 ]; then
+  if [ "${IMAGE_NAME}"x = "x" ]; then
+    IMAGE_NAME="oracle/database-rac:${VERSION}-base"
+  else
+    echo "Image name is passed as a variable"
+  fi
+  DOCKEROPS="${DOCKEROPS//--build-arg SLIMMING=true/}"
+  DOCKEROPS="${DOCKEROPS//--build-arg SLIMMING=false/}"
+  DOCKEROPS+=" --build-arg SLIMMING=true"
+elif [ "${IMAGE_NAME}"x = "x" ] && [ "${SLIM}" == "true" ]; then
+  IMAGE_NAME="oracle/database-rac:${VERSION}-slim"
+elif [ "${IMAGE_NAME}"x = "x" ] && [ "${SLIM}" == "false" ]; then
+  IMAGE_NAME="oracle/database-rac:${VERSION}"
+else
+  echo "Image name is passed as a variable"
+fi
+
+if [ "$VERSION" = "23.26.0" ]; then
+  case "$IMAGE_NAME" in
+    oracle/database-rac:23.26.0) IMAGE_NAME="oracle/database-rac:23.26ai" ;;
+    oracle/database-rac:23.26.0-slim) IMAGE_NAME="oracle/database-rac:23.26ai-slim" ;;
+  esac
+fi
+
+echo "Container Image set to : ${IMAGE_NAME}"
+
+# Resolve the digest before changing into the version directory.
+checkContainerRuntime
+resolve_base_image_metadata "${VERSION}" "oraclelinux:9" "${DOCKEROPS}"
+DOCKEROPS="${DOCKEROPS} ${BASE_IMAGE_BUILD_ARGS}"
+
+# Go into version folder
+#cd "$VERSION" || exit
+
+if [ ${BASE_ONLY} -eq 0 ] && [ ! "${SKIPMD5}" -eq 1 ]; then
+  checksumPackages
+else
+  echo "Ignored MD5 checksum."
+fi
+echo "=========================="
+echo "DOCKER info:"
+"${CONTAINER_RUNTIME}" info
+echo "=========================="
+
+# Proxy settings
+PROXY_SETTINGS=""
+# shellcheck disable=SC2154
+if [ "${http_proxy}" != "" ]; then
+  PROXY_SETTINGS="$PROXY_SETTINGS --build-arg http_proxy=${http_proxy}"
+fi
+# shellcheck disable=SC2154
+if [ "${https_proxy}" != "" ]; then
+  PROXY_SETTINGS="$PROXY_SETTINGS --build-arg https_proxy=${https_proxy}"
+fi
+# shellcheck disable=SC2154
+if [ "${ftp_proxy}" != "" ]; then
+  PROXY_SETTINGS="$PROXY_SETTINGS --build-arg ftp_proxy=${ftp_proxy}"
+fi
+# shellcheck disable=SC2154
+if [ "${no_proxy}" != "" ]; then
+  PROXY_SETTINGS="$PROXY_SETTINGS --build-arg no_proxy=${no_proxy}"
+fi
+# shellcheck disable=SC2154
+if [ "$PROXY_SETTINGS" != "" ]; then
+  echo "Proxy settings were found and will be used during the build."
+fi
+
+# ############################# #
+# BUILDING THE BASE STAGE IMAGE #
+# ############################# #
+
+if [ ${BASE_ONLY} -eq 1 ]; then
+  echo "Building base stage image '${IMAGE_NAME}' ..."
+  # BUILD THE BASE STAGE IMAGE (replace all environment variables)
+  "${CONTAINER_RUNTIME}" build --force-rm=true \
+        --no-cache=true ${DOCKEROPS} ${PROXY_SETTINGS} --build-arg VERSION="${VERSION}" --target final \
+        -t "${IMAGE_NAME}" -f "${VERSION}"/Containerfile . || {
+    echo ""
+    echo "ERROR: Base stage image was NOT successfully created."
+    exit 1
+  }
+  # Remove dangling images (intermitten images with tag <none>)
+  yes | "${CONTAINER_RUNTIME}" image prune > /dev/null || true
+  exit
+fi
+
+# ################## #
+# BUILDING THE IMAGE #
+# ################## #
+echo "Building image '$IMAGE_NAME' ..."
+
+# BUILD THE IMAGE (replace all environment variables)
+BUILD_START=$(date '+%s')
+# shellcheck disable=SC2086
+"${CONTAINER_RUNTIME}" build --force-rm=true --no-cache=true ${DOCKEROPS} ${PROXY_SETTINGS} --build-arg VERSION="${VERSION}" --target final -t ${IMAGE_NAME} -f "${VERSION}"/Containerfile . || {
+  echo "There was an error building the image."
+  exit 1
+}
+BUILD_END=$(date '+%s')
+# shellcheck disable=SC2154,SC2003
+BUILD_ELAPSED=$((BUILD_END - BUILD_START))
+
+echo ""
+# shellcheck disable=SC2181,SC2320
+if [ $? -eq 0 ]; then
+cat << EOF
+  Oracle Database container Image for Real Application Clusters (RAC) version $VERSION is ready to be extended:
+
+    --> $IMAGE_NAME
+
+  Build completed in $BUILD_ELAPSED seconds.
+
+EOF
+
+else
+  echo "Oracle Database Real Application Clusters Container Image was NOT successfully created. Check the output and correct any reported problems with the container build operation."
+fi

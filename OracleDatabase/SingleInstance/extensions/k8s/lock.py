@@ -1,7 +1,7 @@
-#! /usr/bin/python -u
+#! /usr/bin/env python
 # LICENSE UPL 1.0
 #
-# Copyright (c) 2020 Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2020-2026 Oracle and/or its affiliates. All rights reserved.
 #
 # Since: Mar, 2020
 # Author: mohammed.qureshi@oracle.com
@@ -23,6 +23,9 @@ from multiprocessing.connection import Listener, Client
 
 # Multiprocess communication auth key
 AUTHKEY = 'vkidSQkgAHc='
+if hasattr(AUTHKEY, 'encode'):
+    AUTHKEY = AUTHKEY.encode()
+
 DIR_LOCK_FILE = os.sep + '.dirlock'
 
 def acquire_lock(lock_file, sock_file, block, heartbeat):
@@ -35,8 +38,7 @@ def acquire_lock(lock_file, sock_file, block, heartbeat):
     """
 
     # create an empty lock file first
-    open(lock_file, 'a').close()
-    lock_handle = open(lock_file)
+    lock_handle = open(lock_file, 'a')
     print('[%s]: Acquiring lock %s with heartbeat %s secs' %
          (time.strftime('%Y:%m:%d %H:%M:%S'), os.path.basename(lock_file), heartbeat))
     while True:
@@ -68,7 +70,7 @@ def acquire_lock(lock_file, sock_file, block, heartbeat):
                         os.remove(lock_file)
                         open(lock_file, 'w').close()
 
-                lock_handle = open(lock_file)
+                lock_handle = open(lock_file, 'a')
                 print('[%s]: Reacquiring lock %s' %
                      (time.strftime('%Y:%m:%d %H:%M:%S'), os.path.basename(lock_file)))
 

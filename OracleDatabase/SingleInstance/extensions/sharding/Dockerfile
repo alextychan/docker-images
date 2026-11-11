@@ -1,6 +1,7 @@
 # LICENSE UPL 1.0
+# hadolint global ignore=DL3006,DL3002,SC2086
 #
-# Copyright (c) 2021 Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2021-2026 Oracle and/or its affiliates. All rights reserved.
 #
 # ORACLE DOCKERFILES PROJECT
 # --------------------------
@@ -20,16 +21,15 @@
 ARG BASE_IMAGE_VERSION=19.3.0
 ARG BASE_IMAGE=oracle/database:${BASE_IMAGE_VERSION}-ee
 ARG BASE_REPO=https://github.com/oracle/db-sharding
-
 # Creating stage for downloading necessary script files
-FROM oraclelinux:7-slim as downloader
+FROM ${BASE_IMAGE} as downloader
 ARG BASE_REPO
 ENV BASE_REPO=$BASE_REPO
 WORKDIR /tmp
 
-RUN yum -y install gzip tar && \
-    curl -L -o master.tar.gz ${BASE_REPO}/archive/master.tar.gz && \
-    tar -xvf master.tar.gz
+USER root
+RUN yum -y install git && \
+    git clone --depth=1 ${BASE_REPO}
 
 # Creating another stage for sharding extension creation
 FROM ${BASE_IMAGE}
@@ -54,22 +54,51 @@ ENV CMD_EXEC="cmdExec" \
    SSHARD_PY="orasshard.py" \
    RUN_SHARD_FILE="runOraShardSetup.sh" \
    RUN_FILE="runOracle.sh" \
+   SHARD_SCRIPT_DIR="/opt/oracle/scripts/sharding" \
+   PYTHON_FILE="/usr/bin/python" \
+   PYTHON3_FILE="/usr/libexec/platform-python3.6" \
    SHARD_SETUP="false"
 
+# Create Soft link and install python3 RPM
+
+USER root
+RUN yum -y install python3
+RUN if [ ! -f $PYTHON_FILE ]; then \
+      ln -s $PYTHON3_FILE $PYTHON_FILE && \
+      :; \
+    fi && \
+    sync
+
 # backup original runOracle
-RUN if test -e "$ORACLE_BASE/$RUN_FILE.orig"; then EXTN='extended'; else EXTN='orig'; fi ; \
-    mv "$ORACLE_BASE/$RUN_FILE" "$ORACLE_BASE/$RUN_FILE.$EXTN"
+USER oracle
+RUN BASE_RUN_DIR="${SCRIPT_BASE_DIR:-$ORACLE_BASE}" ; \
+    if test -e "$BASE_RUN_DIR/$RUN_FILE.orig"; then EXTN='extended'; else EXTN='orig'; fi ; \
+    mv "$BASE_RUN_DIR/$RUN_FILE" "$BASE_RUN_DIR/$RUN_FILE.$EXTN"
+
+RUN mkdir -p "$SHARD_SCRIPT_DIR/scripts" && \
+    chown -R oracle:dba "$ORACLE_BASE/scripts" && \
+    sync
 
 # Copy updated scripts for sharding support
-COPY  --chown=oracle:dba --from=downloader /tmp/db-sharding-master/docker-based-sharding-deployment/dockerfiles/${BASE_IMAGE_VERSION}/scripts/* $ORACLE_BASE/scripts/sharding/
-RUN mv "$ORACLE_BASE/scripts/sharding/$RUN_FILE" "$ORACLE_BASE/$RUN_FILE.$EXTENSION_NAME"
+COPY  --chown=oracle:dba --from=downloader /tmp/db-sharding/container-based-sharding-deployment/containerfiles/scripts/* $SHARD_SCRIPT_DIR/
+RUN BASE_RUN_DIR="${SCRIPT_BASE_DIR:-$ORACLE_BASE}" && \
+    mv "$SHARD_SCRIPT_DIR/$RUN_FILE" "$BASE_RUN_DIR/$RUN_FILE.$EXTENSION_NAME" && \
+    if [ "$BASE_RUN_DIR" != "$ORACLE_BASE" ]; then \
+      printf '#!/bin/bash\n# shellcheck source=/dev/null\n. "%s/%s.%s"\n' "$BASE_RUN_DIR" "$RUN_FILE" "$EXTENSION_NAME" > "$ORACLE_BASE/$RUN_FILE.$EXTENSION_NAME"; \
+    fi && \
+    chmod 755 "$SHARD_SCRIPT_DIR"/* && \
+    sync
 
 # Set perms and append a call to main runOracle
-RUN if test -e "$ORACLE_BASE/$RUN_FILE.extended"; then \
-        mv "$ORACLE_BASE/$RUN_FILE.extended" "$ORACLE_BASE/$RUN_FILE" ; \
-    else echo ". $ORACLE_BASE/$RUN_FILE.orig" > "$ORACLE_BASE/$RUN_FILE" ; fi ; \
-    if ! grep "$RUN_FILE.$EXTENSION_NAME" "$ORACLE_BASE/$RUN_FILE"; then \
-       sed  -i "\$a . $ORACLE_BASE/$RUN_FILE.$EXTENSION_NAME" "$ORACLE_BASE/$RUN_FILE"; \
+RUN BASE_RUN_DIR="${SCRIPT_BASE_DIR:-$ORACLE_BASE}" ; \
+    if test -e "$BASE_RUN_DIR/$RUN_FILE.extended"; then \
+        mv "$BASE_RUN_DIR/$RUN_FILE.extended" "$BASE_RUN_DIR/$RUN_FILE" ; \
+    else echo ". $BASE_RUN_DIR/$RUN_FILE.orig" > "$BASE_RUN_DIR/$RUN_FILE" ; fi ; \
+    if ! grep "$RUN_FILE.$EXTENSION_NAME" "$BASE_RUN_DIR/$RUN_FILE"; then \
+       sed  -i "\$a . $BASE_RUN_DIR/$RUN_FILE.$EXTENSION_NAME" "$BASE_RUN_DIR/$RUN_FILE"; \
     fi && \
-    sed -i '/wait \$childPID/d' "$ORACLE_BASE"/runOracle.sh.orig && \
-    chmod ug+x $ORACLE_BASE/$RUN_FILE $ORACLE_BASE/$RUN_FILE.$EXTENSION_NAME $ORACLE_BASE/scripts/sharding/*.sh $ORACLE_BASE/scripts/sharding/*.py && sync
+    sed -i '/alert.log/,$ s/wait \$childPID//' "$BASE_RUN_DIR/$RUN_FILE.orig" && \
+    chmod ug+x $BASE_RUN_DIR/$RUN_FILE $BASE_RUN_DIR/$RUN_FILE.$EXTENSION_NAME "$SHARD_SCRIPT_DIR"/*.sh "$SHARD_SCRIPT_DIR"/*.py && \
+    if [ "$BASE_RUN_DIR" != "$ORACLE_BASE" ]; then chmod ug+x "$ORACLE_BASE/$RUN_FILE.$EXTENSION_NAME"; fi && \
+    chown oracle:dba $BASE_RUN_DIR/$RUN_FILE && \
+    sync

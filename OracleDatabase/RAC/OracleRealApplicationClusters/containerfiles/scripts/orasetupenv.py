@@ -1,0 +1,1281 @@
+#!/usr/bin/python
+
+#############################
+# Copyright 2020-2026, Oracle Corporation and/or affiliates.  All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl
+# Author: paramdeep.saini@oracle.com
+#############################
+
+"""
+ This file contains code that invokes different class objects based on setup type
+"""
+
+from oralogger import *
+from oraenv import *
+from oracommon import *
+from oramachine import *
+from orasshsetup import *
+from oracvu import *
+
+from oraops import OperationRunner, CommandBuilder
+import os
+import sys
+import datetime
+import subprocess
+import time
+#from threading import Thread
+
+class OraSetupEnv:
+    """
+    This class sets up the environment before RAC setup
+    """
+    def __init__(self,oralogger,orahandler,oraenv,oracommon,oracvu,orasetupssh):
+      try:
+         self.ologger             = oralogger
+         self.ohandler            = orahandler
+         self.oenv                = oraenv.get_instance()
+         self.ocommon             = oracommon
+         self.ocvu                = oracvu
+         self.osetupssh           = orasetupssh
+         self.ora_env_dict        = oraenv.get_env_vars()
+         self.file_name           = os.path.basename(__file__)
+         self.op_runner           = OperationRunner(self.ocommon, self.file_name, "ENV")
+         self.cmd_builder         = CommandBuilder(self.ocommon)
+      except BaseException as ex:
+         ex_type, ex_value, ex_traceback = sys.exc_info()
+         trace_back = sys.tracebacklimit.extract_tb(ex_traceback)
+         stack_trace = list()
+         for trace in trace_back:
+             stack_trace.append("File : %s , Line : %d, Func.Name : %s, Message : %s" % (trace[0], trace[1], trace[2], trace[3]))
+         self.ocommon.log_info_message(ex_type.__name__,self.file_name)
+         self.ocommon.log_info_message(ex_value,self.file_name)
+         self.ocommon.log_info_message(stack_trace,self.file_name)
+
+    def setup(self):
+        """
+        Set up environment on this machine.
+        """
+        
+        self.ocommon.log_step("ENV", "setup", "start", None, self.file_name)
+        ct = datetime.datetime.now()
+        bts = ct.timestamp()
+        if self.ocommon.check_key("RESET_PASSWORD",self.ora_env_dict):
+           self.ocommon.log_info_message("RESET_PASSWORD variable is set. Resetting the OS password for users: " + self.ora_env_dict["RESET_PASSWORD"],self.file_name)
+           for user in self.ora_env_dict["RESET_PASSWORD"].split(','):
+               self.ocommon.reset_os_password(user)
+        elif self.ocommon.check_key("CUSTOM_RUN_FLAG",self.ora_env_dict):
+           self.populate_env_vars() 
+        else:
+         if self.ocommon.check_key("DBCA_RESPONSE_FILE",self.ora_env_dict):
+            self.ocommon.update_rac_env_vars_from_rspfile(self.ora_env_dict["DBCA_RESPONSE_FILE"])
+         if not self.ocommon.check_key("SINGLE_NETWORK",self.ora_env_dict):
+            install_node,pubhost=self.ocommon.get_installnode()
+            if install_node.lower() == pubhost.lower():
+               if not self.ocommon.check_key("GRID_RESPONSE_FILE",self.ora_env_dict):
+                  self.validate_private_nodes()
+         #self.ocommon.update_domainfrom_resolvconf_file()
+         self.populate_env_vars()
+         # Fix Kubernetes injected /16 alias on public interface
+         self.normalize_pod_public_mask()
+         self.check_statefile()
+         self.env_var_checks()
+         self.stdby_env_var_checks()
+         self.set_gateway()
+         self.add_ntp_conf()
+         self.touch_fstab()
+         self.reset_systemd()
+         self.check_systemd()
+         self.set_ping_permission()
+         self.set_common_script()
+         self.add_domain_search()
+         self.add_dns_servers()
+         self.populate_etchosts("localhost")
+         self.populate_user_profiles()
+         #self.setup_ssh_for_k8s()
+         self.setup_gi_sw()
+         self.configure_legacy_scp_for_19c()
+         self.set_asmdev_perm()
+         self.reset_grid_user_passwd()        
+         self.setup_db_sw()
+         self.adjustMemlockLimits()
+         self.reset_db_user_passwd()
+        # self.ocommon.log_info_message("Start crs_sw_install()",self.file_name)
+        # self.crs_sw_install()
+        # self.ocommon.log_info_message("End crs_sw_install()",self.file_name)
+         self.ocommon.log_step("ENV", "comment_out_swap_space", "start", None, self.file_name)
+         self.comment_out_swap_space()
+         self.ocommon.log_step("ENV", "comment_out_swap_space", "end", None, self.file_name)
+         self.create_ssh_keypair()
+         self.setup_ssh_for_k8s()
+         self.set_banner()
+
+        ct = datetime.datetime.now()
+        ets = ct.timestamp()
+        totaltime=ets - bts
+        # --------------------------------------------------
+        # Final validation (single authority)
+        # --------------------------------------------------
+        self.finalize_orasetupenv(bts)
+ 
+      ###########  SETUP_MACHINE ENDS here ####################
+
+    ## Function to perform DB checks ######
+    def populate_env_vars(self):
+        """
+        Populate the env vars if not set
+        """
+        self.ocommon.populate_rac_env_vars()
+        if self.ocommon.check_key("CRS_GPC",self.ora_env_dict):
+           if self.ocommon.ora_env_dict["CRS_GPC"].lower() == 'true':
+              self.ora_env_dict=self.ocommon.add_key("DB_CONFIG_TYPE","SINGLE",self.ora_env_dict)
+           pubnode=self.ocommon.get_public_hostname()
+           crs_nodes="pubhost="+pubnode
+           if not self.ocommon.check_key("CRS_NODES",self.ora_env_dict):
+              self.ora_env_dict=self.ocommon.add_key("CRS_NODES",crs_nodes,self.ora_env_dict)
+           else:
+              self.ora_env_dict=self.ocommon.update_key("CRS_NODES",crs_nodes,self.ora_env_dict)
+        else:
+         if not self.ocommon.check_key("CRS_NODES",self.ora_env_dict):
+            msg="CRS_NODES is not passed as an env variable. If CRS_NODES is not passed as env variable then user must pass PUBLIC_HOSTS,VIRTUAL_HOSTS and PRIVATE_HOST as en env variable so that CRS_NODES can be populated."
+            self.ocommon.log_error_message(msg,self.file_name)
+            self.populate_crs_nodes()
+        # ----------------------------------------------------
+        # Default orasetupenv timeout (in minutes)
+        # ----------------------------------------------------
+        if not self.ocommon.check_key("ORASETUPENV_TIMEOUT_MINUTES", self.ora_env_dict):
+           self.ora_env_dict = self.ocommon.add_key(
+                 "ORASETUPENV_TIMEOUT_MINUTES", "15", self.ora_env_dict
+           )
+
+           self.ocommon.log_info_message(
+                 "ORASETUPENV_TIMEOUT_MINUTES not set, defaulting to 15 minutes",
+                 self.file_name
+           )
+
+    def check_statefile(self):
+       """
+       populate the state file
+       """
+       file=self.oenv.statelogfile_name()
+       if not self.ocommon.check_file(file,"local",None,None):
+          self.ocommon.create_file(file,"local",None,None)
+       if self.ocommon.check_key("OP_TYPE",self.ora_env_dict):
+         if self.ora_env_dict["OP_TYPE"] == 'setuprac':
+           self.ocommon.update_statefile("provisioning")
+         elif self.ora_env_dict["OP_TYPE"] == 'nosetup':
+           self.ocommon.update_statefile("provisioning")
+         elif self.ora_env_dict["OP_TYPE"] == 'addnode':
+            self.ocommon.update_statefile("addnode")
+         else:
+            pass
+          
+    def populate_crs_nodes(self):
+        """
+        Populate CRS_NODES variable using PUBLIC_HOSTS,VIRTUAL_HOSTS and PRIVATE_HOSTS
+        """
+        pub_node_list=[]
+        virt_node_list=[]
+        priv_node_list=[]
+
+        crs_nodes=""
+        if not self.ocommon.check_key("PUBLIC_HOSTS",self.ora_env_dict):
+           self.ocommon.log_error_message("PUBLIC_HOSTS list is not found in env variable list. Exiting...",self.file_name)
+           self.ocommon.prog_exit("127")
+        else:
+           pub_node_list=self.ora_env_dict["PUBLIC_HOSTS"].split(",")
+
+        if not self.ocommon.check_key("VIRTUAL_HOSTS",self.ora_env_dict):
+           self.ocommon.log_error_message("VIRTUAL_HOSTS list is not found in env variable list. Exiting...",self.file_name)
+           self.ocommon.prog_exit("127")
+        else:
+           virt_node_list=self.ora_env_dict["VIRTUAL_HOSTS"].split(",")
+
+        if not self.ocommon.check_key("CRS_PRIVATE_IP1",self.ora_env_dict) and not self.ocommon.check_key("CRS_PRIVATE_IP2",self.ora_env_dict):
+          if self.ocommon.check_key("PRIVATE_HOSTS",self.ora_env_dict):
+              priv_node_list=self.ora_env_dict["PRIVATE_HOSTS"].split(",")
+
+        if not self.ocommon.check_key("SINGLE_NETWORK",self.ora_env_dict): 
+           if len(pub_node_list) == len(virt_node_list) and len(pub_node_list) == len(priv_node_list):
+              for (pubnode,vipnode,privnode) in zip(pub_node_list,virt_node_list,priv_node_list):
+                 crs_nodes= crs_nodes + "pubhost=" + pubnode + "," + "viphost=" + vipnode + "," + "privhost=" + privnode + ";"
+           else:
+             if len(pub_node_list) == len(virt_node_list):
+                for (pubnode,vipnode,privnode) in zip(pub_node_list,virt_node_list):                 
+                   crs_nodes= crs_nodes + "pubhost=" + pubnode + "," + "viphost=" + vipnode + ";"
+             else:
+                self.ocommon.log_error_message("public node and virtual host node count is not equal",self.file_name)
+                self.ocommon.prog_exit("127")               
+        else:
+           if len(pub_node_list) == len(virt_node_list):
+              for (pubnode,vipnode,privnode) in zip(pub_node_list,virt_node_list):
+                 crs_nodes= crs_nodes + "pubhost=" + pubnode + "," + "viphost=" + vipnode + ";"              
+        
+        crs_nodes=crs_nodes.strip(";")
+        self.ora_env_dict=self.ocommon.add_key("CRS_NODES",crs_nodes,self.ora_env_dict)
+        self.ocommon.log_info_message("CRS_NODES is populated: " + self.ora_env_dict["CRS_NODES"] ,self.file_name)
+
+    def validate_private_nodes(self):
+        """
+        This function validate the private network
+        """
+        priv_node_status=False
+
+        if self.ocommon.check_key("PRIVATE_HOSTS",self.ora_env_dict):
+           priv_node_status=True
+           priv_node_list=self.ora_env_dict["PRIVATE_HOSTS"].split(",")
+        else:
+           self.ocommon.log_info_message("PRIVATE_HOSTS is not set.",self.file_name)
+
+        if self.ocommon.check_key("CRS_GPC",self.ora_env_dict):
+           pubnode=self.ocommon.get_public_hostname()
+           domain=self.ora_env_dict["PUBLIC_HOSTS_DOMAIN"] if self.ocommon.check_key("PUBLIC_HOSTS_DOMAIN",self.ora_env_dict) else self.ocommon.get_host_domain()
+           if domain is None:
+               self.ocommon.log_error_message("PUBLIC_HOSTS_DOMAIN is not set.",self.file_name)
+           value=self.ocommon.get_ip(pubnode,domain)
+           if not self.ocommon.check_key("CRS_PRIVATE_IP1",self.ora_env_dict):
+            self.ora_env_dict=self.ocommon.add_key("CRS_PRIVATE_IP1",value,self.ora_env_dict)
+           else:   
+            self.ora_env_dict=self.ocommon.update_key("CRS_PRIVATE_IP1",value,self.ora_env_dict)
+           priv_node_status=True
+        else:
+         if self.ocommon.check_key("CRS_PRIVATE_IP1",self.ora_env_dict):
+            priv_node_status=True
+            priv_ip1_list=self.ora_env_dict["CRS_PRIVATE_IP1"].split(",")
+            for ip in priv_ip1_list:
+                  self.ocommon.ping_ip(ip,True)
+         else:
+            self.ocommon.log_info_message("CRS_PRIVATE_IP1 is not set.",self.file_name)
+
+         if self.ocommon.check_key("CRS_PRIVATE_IP2",self.ora_env_dict):
+            priv_node_status=True
+            priv_ip2_list=self.ora_env_dict["CRS_PRIVATE_IP2"].split(",")
+            for ip in priv_ip2_list:
+                  self.ocommon.ping_ip(ip,True)
+         else:
+            self.ocommon.log_info_message("CRS_PRIVATE_IP2 is not set.",self.file_name)
+
+        if not priv_node_status:
+           self.ocommon.log_error_message("PRIVATE_HOSTS or CRS_PRIVATE_IP1 or CRS_PRIVATE_IP2 list is not found in env variable list. Exiting...",self.file_name)
+           self.ocommon.prog_exit("127")
+
+    def env_var_checks(self):
+        """
+        check the env vars
+        """
+        self.ocommon.check_env_variable("GRID_HOME",True)
+        self.ocommon.check_env_variable("GRID_BASE",True)
+        self.ocommon.check_env_variable("INVENTORY",True)
+        self.ocommon.check_env_variable("DB_HOME",False)
+        self.ocommon.check_env_variable("DB_BASE",False)
+
+    def stdby_env_var_checks(self):
+        """
+        Check standby environment variables
+        """
+        if self.ocommon.check_key("OP_TYPE",self.ora_env_dict):
+           if self.ora_env_dict["OP_TYPE"] == 'setupracstandby':
+             self.ocommon.check_env_variable("DB_UNIQUE_NAME",False)
+             self.ocommon.check_env_variable("PRIMARY_DB_SCAN_PORT",False)
+             self.ocommon.check_env_variable("PRIMARY_DB_NAME",True)
+             self.ocommon.check_env_variable("PRIMARY_DB_SERVICE_NAME",False)
+             self.ocommon.check_env_variable("PRIMARY_DB_UNIQUE_NAME",True)
+             self.ocommon.check_env_variable("PRIMARY_DB_SCAN_NAME",True)
+
+    def set_gateway(self):
+        """
+        Set the default gateway
+        """
+        if self.ocommon.check_key("DEFAULT_GATEWAY",self.ora_env_dict):
+            self.ocommon.log_info_message("DEFAULT_GATEWAY variable is set. Validating the gateway gw",self.file_name)
+            if self.ocommon.validate_ip(self.ora_env_dict["DEFAULT_GATEWAY"]):
+                #cmd='''ip route; ip route del default'''
+                cmd='''ip route; ip route flush 0/0;ip route'''
+                output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, None)
+                ### Set the Default gw
+                self.ocommon.log_info_message("Setting default gateway based on new gateway setting",self.file_name)
+                cmd='''route add default gw {0}'''.format(self.ora_env_dict["DEFAULT_GATEWAY"])
+                output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, None)
+            else:
+                self.ocommon.log_error_message("DEFAULT_GATEWAY IP is not correct. Exiting...",self.file_name)
+                self.ocommon.prog_exit("NONE")
+
+    def add_ntp_conf(self):
+        """
+        This function start the NTP daemon
+        """
+        if self.ocommon.check_key("NTP_START",self.ora_env_dict):
+            self.ocommon.log_info_message("NTP_START variable is set. Touching /etc/ntpd.conf",self.file_name)
+            cmd='''touch /etc/ntp.conf'''
+            output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+            ### Start NTP
+            self.ocommon.log_info_message("NTP_START variable is set. Starting NTPD",self.file_name)
+            cmd='''systemctl start ntpd'''
+            output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+
+    def populate_etchosts(self,entry):
+        """
+        Populating hosts file
+        """
+        etchostfile="/etc/hosts"
+        if not self.ocommon.detect_k8s_env(): 
+            if self.ocommon.check_key("HOSTFILE",self.ora_env_dict):
+               if os.path.exists(self.ora_env_dict["HOSTFILE"]):
+                  cmd='''cat {0} > /etc/hosts'''.format(self.ora_env_dict["HOSTFILE"])
+                  output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+            else:
+               lentry='''127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4 \n::1   localhost localhost.localdomain localhost6 localhost6.localdomain6'''
+               
+               self.write_etchost("localhost.localdomain",etchostfile,"write",lentry)
+               if not self.ocommon.check_key("CRS_GPC",self.ora_env_dict):
+                  if self.ocommon.check_key("CRS_NODES",self.ora_env_dict):
+                     pub_nodes,vip_nodes,priv_nodes=self.ocommon.process_cluster_vars("CRS_NODES")
+                     pub_nodes1=pub_nodes.replace(" ",",")
+                     vip_nodes1=vip_nodes.replace(" ",",")
+                     for node in pub_nodes1.split(","):
+                           self.ocommon.log_info_message("The node set to :" +  node + "-" + pub_nodes1,self.file_name)
+                           self.write_etchost(node,etchostfile,"append",None)
+                     for node in vip_nodes1.split(","):
+                           self.write_etchost(node,etchostfile,"append",None)
+                                                    
+    def write_etchost(self,node,file,mode,lentry):
+       """
+       This function writes an entry to /etc/hosts if the entry does not exist
+       """
+       if node == "":
+          self.ocommon.log_info_message("write_etchost(): Node is : [NULL]. PASS",self.file_name)
+          return
+       if mode == 'append':
+          #fdata=self.ocommon.read_file(file)
+          #if not match:
+           domain=self.ora_env_dict["PUBLIC_HOSTS_DOMAIN"] if self.ocommon.check_key("PUBLIC_HOSTS_DOMAIN",self.ora_env_dict) else self.ocommon.get_host_domain()
+           if domain is None:
+               self.ocommon.log_error_message("PUBLIC_HOSTS_DOMAIN is not set.",self.file_name)
+           if self.ocommon.check_key("PUBLIC_HOSTS_DOMAIN",self.ora_env_dict):
+             self.ora_env_dict=self.ocommon.update_key("PUBLIC_HOSTS_DOMAIN",domain,self.ora_env_dict)
+           else:
+             self.ora_env_dict=self.ocommon.add_key("PUBLIC_HOSTS_DOMAIN",domain,self.ora_env_dict)
+           self.ocommon.log_info_message("Domain is :" + self.ora_env_dict["PUBLIC_HOSTS_DOMAIN"],self.file_name)
+           self.ocommon.log_info_message("The hostname :" + node + "." + domain,self.file_name)
+           ip=self.ocommon.get_ip(node,domain)
+          # self.ocommon.log_info_message(" The Ip set to :", ip)
+           entry='''{0}    {1}     {2}'''.format(ip,node + "." + domain,node)
+          # self.ocommon.log_info_message(" The  entry set to :", entry)
+           cmd='''echo {0} >> {1}'''.format(entry,file)
+           output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+       elif mode == 'write':
+          #fdata=self.ocommon.read_file(file)
+          #if not match:
+           #self.ocommon.log_info_message(" The  lentry set to :", lentry)
+           cmd='''echo "{0}" > "{1}"'''.format(lentry,file)
+           output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)                   
+       else:
+         pass
+               
+    def touch_fstab(self):
+        """
+        This function touches fstab
+        """
+        cmd='''touch /etc/fstab'''
+        output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+
+    def  reset_systemd(self):
+        """
+        This function reset the systemd
+        """
+        self.ocommon.log_info_message("Checking systemd failed units.",self.file_name)
+        cmd="""systemctl | grep failed | awk '{ print $2 }'"""
+        output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+        self.ocommon.log_info_message("Disabling failed units.",self.file_name)
+        if output:
+          for svc in output.split('\n'):
+              if svc:
+                cmd='''systemctl disable {0}'''.format(svc)
+                output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+        self.ocommon.log_info_message("Resetting systemd.",self.file_name)
+        cmd='''systemctl reset-failed'''
+        output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, None)
+        
+    def check_systemd(self):
+        """
+        This function check systemd and exit the program if systemd status is not running
+        """
+        self.ocommon.log_info_message("Checking systemd. It must be in running state to setup clusterware inside containers for clusterware.",self.file_name)
+        cmd="""systemctl status | awk '/State:/{ print $0 }' | grep -v 'awk /State:/' | awk '{ print $2 }'"""
+        output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+        if 'running' in output:
+           self.ocommon.log_info_message("Systemctl status check passed!",self.file_name)
+        else:
+           self.ocommon.log_error_message("Systemctl is not in running state.",self.file_name)
+           #self.ocommon.prog_exit("None")
+
+    def set_ping_permission(self):
+        """
+        setting ping permission
+        """
+        pass
+        #self.ocommon.log_info_message("Setting ping utility permissions so that it works correctly inside container",self.file_name)
+        #cmd='''chmod 6755 /usr/bin/ping;chmod 6755 /bin/ping'''
+        #output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+        #self.ocommon.check_os_err(output,error,retcode,None)
+        
+    def adjustMemlockLimits(self):
+      """
+      Adjust the soft and hard memory limits for the oracle db
+      """
+      oracleDBConfigFile=None
+      gridDBConfigFile=None
+      memoryFile=None
+      
+      cmd='''mount | grep -i cgroup | awk \'{ print $1 }\''''
+      output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+      oraversion=self.ocommon.get_rsp_version("INSTALL",None)
+      version=oraversion.split(".",1)[0].strip()
+      if int(version) < 23:
+         oracleDBConfigFile="/etc/security/limits.d/oracle-database-preinstall-23c.conf"
+         gridDBConfigFile="/etc/security/limits.d/grid-database-preinstall-23c.conf"
+      else:
+         oracleDBConfigFile="/etc/security/limits.d/oracle-ai-database-preinstall-26ai.conf"
+         gridDBConfigFile="/etc/security/limits.d/grid-ai-database-preinstall-26ai.conf"
+         
+      cgroupVersion=output.strip()
+      if cgroupVersion == 'cgroup2':
+         memoryFile="/sys/fs/cgroup/memory.max"
+      else:
+         memoryFile="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+         
+      if self.ocommon.check_file(memoryFile,"local",None,None):
+         self.ocommon.log_info_message("memoryFile=[" + memoryFile + "]",self.file_name)
+
+         cmd='''expr `cat {0}` / 1024'''.format(memoryFile)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+         containerMemory=output.strip()
+         cmd='''expr {0} \* 9 / 10'''.format(containerMemory)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+         containerMemory=output.strip()
+         self.ocommon.log_info_message("containerMemory=[" + containerMemory + "]",self.file_name)
+
+         cmd='''grep " memlock " {0} | grep -v "^#" | grep hard | awk \'{{ print $4 }}\''''.format(oracleDBConfigFile)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+         fileMemlockVal=output.strip()
+
+         cmd='''sed -i -e \'s,{0},{1},g\' {2}'''.format(fileMemlockVal,containerMemory,oracleDBConfigFile)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+
+         cmd='''grep " memlock " {0} | grep -v "^#" | grep hard | awk \'{{ print $4 }}\''''.format(gridDBConfigFile)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+         fileMemlockVal=output.strip()
+
+         cmd='''sed -i -e \'s,{0},{1},g\' {2}'''.format(fileMemlockVal,containerMemory,gridDBConfigFile)
+         output,error,retcode=self.ocommon.execute_cmd(cmd,None,None)
+        
+    def set_common_script(self):
+        """
+        This function set the 775 permission on common script dir
+        """
+        if self.ocommon.check_key("COMMON_SCRIPTS",self.ora_env_dict):
+            self.ocommon.log_info_message("COMMON_SCRIPTS variable is set.",self.file_name)
+            if os.path.isdir(self.ora_env_dict["COMMON_SCRIPTS"]):
+                self.ocommon.log_info_message("COMMON_SCRIPT variable is set. Changing permissions and ownership",self.file_name)
+                cmd='''chown -R grid:oinstall {0}; chmod 775 {0}'''.format(self.ora_env_dict["COMMON_SCRIPTS"])
+                output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+            else:
+                self.ocommon.log_info_message("COMMON_SCRIPT variable is set but directory doesn't exist!",self.file_name)
+
+    def set_asmdev_perm(self):
+        """
+        This function set the correct permissions for ASM Disks
+        """
+        self.ocommon.set_asmdisk_perm("CRS_ASM_DEVICE_LIST",True)
+        self.ocommon.set_asmdisk_perm("REDO_ASM_DEVICE_LIST",None)
+        self.ocommon.set_asmdisk_perm("RECO_ASM_DEVICE_LIST",None)
+        self.ocommon.set_asmdisk_perm("DB_ASM_DEVICE_LIST",None)
+        if self.ocommon.check_key("CLUSTER_TYPE",self.ora_env_dict):
+            if self.ora_env_dict["CLUSTER_TYPE"] == 'DOMAIN':
+                if self.ocommon.check_key("GIMR_ASM_DEVICE_LIST",self.ora_env_dict):
+                   self.ocommon.set_asmdisk_perm("GIMR_ASM_DEVICE_LIST",True) 
+
+    ## Function add DOMAIN Server 
+    def add_domain_search(self):
+        """
+         This function update search in /etc/resolv.conf
+        """
+        dns_search_flag=None
+        search_domain='search'
+        if self.ocommon.check_key("PUBLIC_HOSTS_DOMAIN",self.ora_env_dict):
+            self.ocommon.log_info_message("PUBLIC_HOSTS_DOMAIN variable is set. Populating /etc/resolv.conf.",self.file_name)
+            dns_search_flag=True
+            for domain in self.ora_env_dict["PUBLIC_HOSTS_DOMAIN"].split(','):
+                search_domain = search_domain + ' ' + domain
+
+        if self.ocommon.check_key("PRIVATE_HOSTS_DOMAIN",self.ora_env_dict):
+            self.ocommon.log_info_message("PRIVATE_HOSTS_DOMAIN variable is set. Populating /etc/resolv.conf.",self.file_name)
+            dns_search_flag=True
+            for domain in self.ora_env_dict["PRIVATE_HOSTS_DOMAIN"].split(','):
+                search_domain = search_domain + ' ' + domain
+
+        if self.ocommon.check_key("CUSTOM_DOMAIN",self.ora_env_dict):
+            self.ocommon.log_info_message("CUSTOM_DOMAIN variable is set. Populating /etc/resolv.conf.",self.file_name)
+            dns_search_flag=True
+            for domain in self.ora_env_dict["CUSTOM_DOMAIN"].split(','):
+                search_domain = search_domain + ' ' + domain
+
+        if dns_search_flag:
+            self.ocommon.log_info_message("Search domain {0} is ready. Adding entries in /etc/resolv.conf".format(search_domain),self.file_name)
+            cmd='''echo "{0}" > /etc/resolv.conf'''.format(search_domain)
+            output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+        
+    ## Function to perform grid software installation ######
+    def add_dns_servers(self):
+        """
+        This function add the dns servers
+        """
+        if self.ocommon.check_key("DNS_SERVERS",self.ora_env_dict):
+           self.ocommon.log_info_message("DNS_SERVERS variable is set. Populating /etc/resolv.conf with DNS servers.",self.file_name)
+           resolv_conf = open('/etc/resolv.conf').read()
+           for server in self.ora_env_dict["DNS_SERVERS"].split(','):
+               if server not in resolv_conf:
+                    cmd='''echo "nameserver  {0}" >> /etc/resolv.conf'''.format(server)
+                    output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+                    resolv_conf = resolv_conf + "\nnameserver  {0}".format(server)
+        else:
+            self.ocommon.log_info_message("DNS_SERVERS variable is not set.",self.file_name)
+
+
+    ## Function to perform Oracle software installation ######
+    def _setup_software(self, sw_zip_key, copy_key, params_getter, unzip_flag_key,
+                        sw_label, missing_action_msg, setup_dir_messages,
+                        not_empty_msg):
+      # Shared software setup helper for GI/DB software unzip paths.
+      if not self.ocommon.check_key("OP_TYPE", self.ora_env_dict):
+         return
+
+      if not (self.ocommon.check_key("STAGING_SOFTWARE_LOC", self.ora_env_dict) and
+              self.ocommon.check_key(sw_zip_key, self.ora_env_dict)):
+         return
+
+      swfile = self.ora_env_dict["STAGING_SOFTWARE_LOC"] + "/" + self.ora_env_dict[sw_zip_key]
+      if os.path.isfile(swfile):
+         if not self.ocommon.check_key(copy_key, self.ora_env_dict):
+            self.ora_env_dict = self.ocommon.add_key(copy_key, "True", self.ora_env_dict)
+
+         user, home, base, oinv = params_getter()
+         grp = self.ora_env_dict["OINSTALL"]
+
+         self.ocommon.log_info_message("Copy Software flag is set", self.file_name)
+
+         setup_dirs = {
+            "oinv": oinv,
+            "base": base,
+            "home": home,
+         }
+         for key, msg in setup_dir_messages:
+            self.ocommon.log_info_message(msg, self.file_name)
+            self.setup_sw_dirs(setup_dirs[key], user, grp)
+
+         home_files = os.listdir(setup_dirs["home"])
+         if len(home_files) == 0:
+            self.ocommon.log_info_message(sw_label + " software file is set : " + swfile, self.file_name)
+            self.ocommon.log_info_message("Starting " + sw_label.lower() + " software unzipping file", self.file_name)
+            cmd='su - {0} -c " unzip -q {1} -d {2}"'.format(user, swfile, setup_dirs["home"])
+            output, error, retcode = self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)
+            self.ora_env_dict = self.ocommon.add_key(unzip_flag_key, "true", self.ora_env_dict)
+         else:
+            self.ocommon.log_error_message(not_empty_msg, self.file_name)
+      else:
+         install_node, pubhost = self.ocommon.get_installnode()
+         if install_node.lower() == pubhost.lower():
+            self.ocommon.log_error_message(missing_action_msg.format(swfile), self.file_name)
+            self.ocommon.prog_exit("127")
+         else:
+            self.ocommon.log_info_message(
+               (sw_label.lower() + " software file " + swfile +
+                " doesn't exist. software will be copied from install node..." + install_node.lower()),
+               self.file_name
+            )
+
+    ## Function to perform grid software installation ######
+    def setup_gi_sw(self):
+      """
+      This function unzip the Grid and Oracle Software
+      """
+      self._setup_software(
+         sw_zip_key="GRID_SW_ZIP_FILE",
+         copy_key="COPY_GRID_SOFTWARE",
+         params_getter=self.ocommon.get_gi_params,
+         unzip_flag_key="GI_SW_UNZIPPED_FLAG",
+         sw_label="Grid",
+         missing_action_msg="grid software file {0} doesn't exist. Exiting...",
+         setup_dir_messages=(
+            ("oinv", "Setting up Oracle inventory directory!"),
+            ("base", "Setting up Grid_BASE directory!"),
+            ("home", "Setting up Grid_HOME directory!"),
+         ),
+         not_empty_msg="oracle gi home directory is not empty. skipping software unzipping...",
+      )
+
+    ## Function to unzip the software
+    def setup_db_sw(self):
+      """
+      unzip the software
+      """
+      self._setup_software(
+         sw_zip_key="DB_SW_ZIP_FILE",
+         copy_key="COPY_DB_SOFTWARE",
+         params_getter=self.ocommon.get_db_params,
+         unzip_flag_key="RAC_SW_UNZIPPED_FLAG",
+         sw_label="DB",
+         missing_action_msg="db software file {0} does not exist. Exiting...",
+         setup_dir_messages=(
+            ("base", "Setting up ORACLE_BASE directory!"),
+            ("home", "Setting up DB_HOME directory!"),
+         ),
+         not_empty_msg="oracle db home directory is not empty. skipping software unzipping...",
+      )
+
+    def setup_sw_dirs(self,dir,user,group):
+        """
+        Set up Oracle software directories if not already created.
+        """
+        if os.path.isdir(dir):
+           self.ocommon.log_info_message("Directory " + dir   +  " already exists!",self.file_name)   
+        else:
+           self.ocommon.log_info_message("Creating dir " + dir,self.file_name)
+           cmd='''mkdir -p {0}'''.format(dir)
+           output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True)         
+           ####
+           self.ocommon.log_info_message("Changing the permissions of directory",self.file_name)
+           cmd='''chown -R {0}:{1} {2}'''.format(user,group,dir)
+           output,error,retcode=self.op_runner.run_command("env_execute_cmd", cmd, None, None, True) 
+
+
+###### Checking GI Home #######
+    def _should_reset_os_password(self):
+        """Return True when passwords should be reset for nosetup without SSH keys."""
+        return (
+           self.ocommon.check_key("OP_TYPE", self.ora_env_dict)
+           and self.ora_env_dict["OP_TYPE"] == 'nosetup'
+           and not self.ocommon.check_key("SSH_PRIVATE_KEY", self.ora_env_dict)
+           and not self.ocommon.check_key("SSH_PUBLIC_KEY", self.ora_env_dict)
+        )
+
+    def _reset_user_password(self, user_key):
+        if self._should_reset_os_password():
+           user = self.ora_env_dict[user_key]
+           self.ocommon.log_info_message("Resetting OS Password for OS user : " + user, self.file_name)
+           self.ocommon.reset_os_password(user)
+
+    def reset_grid_user_passwd(self):
+        """
+        This function checks GI home and resets the GI user password when required
+        """
+        self._reset_user_password("GRID_USER")
+
+###### Checking RAC Home #######
+    def reset_db_user_passwd(self):
+        """
+        This function checks RAC home and resets the DB user password when required
+        """
+        self._reset_user_password("DB_USER")
+
+    ###### Setting up parallel Oracle and Grid User setup using Keys ####
+    def setup_ssh_using_keys(self, sshi):
+      """
+      Setting up SSH using keys.
+      INSTALL  : populate keys from secrets
+      ADDNODE  : reuse existing cluster keys (DO NOT overwrite)
+      """
+
+      self.ocommon.log_info_message(
+         "Entering setup_ssh_using_keys", self.file_name
+      )
+
+      uohome = sshi.split(":")
+      user = uohome[0]
+      ohome = uohome[1]
+
+      self.ocommon.log_info_message(
+         "setup_ssh_using_keys user={0} home={1}".format(user, ohome),
+         self.file_name
+      )
+
+      # ------------------------------------------------------------
+      # Determine operation type
+      # ------------------------------------------------------------
+      ctype = None
+      
+      # ------------------------------------------------------------
+      # SSH directory handling
+      # ------------------------------------------------------------
+      self.osetupssh.setupsshdirs(user, ohome, ctype)
+
+      # ------------------------------------------------------------
+      # SSH key distribution (idempotent)
+      # ------------------------------------------------------------
+      self.osetupssh.setupsshusekey(user, ohome, ctype)
+
+      # verifyssh intentionally deferred / conditional
+      # self.osetupssh.verifyssh(user, None)
+
+###### Setting up ssh for K8s #######
+    def setup_ssh_for_k8s(self):
+        """
+        Set up SSH using private and public keys in K8s environment.
+        """
+        if self.ocommon.check_key("SSH_PRIVATE_KEY",self.ora_env_dict) and self.ocommon.check_key("SSH_PUBLIC_KEY",self.ora_env_dict):
+           if self.ocommon.check_file(self.ora_env_dict["SSH_PRIVATE_KEY"],True,None,None) and self.ocommon.check_file(self.ora_env_dict["SSH_PUBLIC_KEY"],True,None,None):
+              self.ocommon.log_info_message("Begin SSH Setup using SSH_PRIVATE_KEY and SSH_PUBLIC_KEY",self.file_name)
+              giuser,gihome,obase,invloc=self.ocommon.get_gi_params()
+              dbuser,dbhome,dbase,oinv=self.ocommon.get_db_params()
+              self.ocvu.cluvfy_updcvucfg(gihome,giuser)
+              SSH_USERS=giuser + ":" + gihome,dbuser + ":" + dbhome
+              for sshi in SSH_USERS:
+                 self.setup_ssh_using_keys(sshi)
+
+              self.ocommon.log_info_message("End SSH Setup using SSH_PRIVATE_KEY and SSH_PUBLIC_KEY",self.file_name)
+        else:
+          if self.ocommon.detect_k8s_env():
+             self.ocommon.log_error_message("SSH_PRIVATE_KEY and SSH_PUBLIC_KEY are not set in K8s environment. Exiting...",self.file_name)
+             self.ocommon.prog_exit("127")
+
+    def create_ssh_keypair(self):
+      """
+      Generate SSH key pair only if they are not present.
+      Set their paths in self.ora_env_dict as SSH_PRIVATE_KEY and SSH_PUBLIC_KEY.
+      """
+      privkey_path = "/tmp/id_rsa"
+      pubkey_path = "/tmp/id_rsa.pub"
+      if self.ocommon.check_key("CRS_GPC", self.ora_env_dict): # only for oracle restart
+         # Check if already set
+         if not self.ocommon.check_key("SSH_PRIVATE_KEY", self.ora_env_dict) or \
+            not self.ocommon.check_key("SSH_PUBLIC_KEY", self.ora_env_dict) or \
+            not (os.path.exists(privkey_path) and os.path.exists(pubkey_path)):
+            if not (os.path.exists(privkey_path) and os.path.exists(pubkey_path)):
+                  cmd = [
+                     "ssh-keygen", "-t", "rsa", "-b", "4096",
+                     "-f", privkey_path, "-N", ""
+                  ]
+                  subprocess.run(cmd, check=True)
+                  os.chmod(privkey_path, 0o600)
+                  os.chmod(pubkey_path, 0o644)
+            # Set environment dictionary values (add/remove as per your ocommon.add_key implementation)
+            self.ora_env_dict = self.ocommon.add_key("SSH_PRIVATE_KEY", privkey_path, self.ora_env_dict)
+            self.ora_env_dict = self.ocommon.add_key("SSH_PUBLIC_KEY", pubkey_path, self.ora_env_dict)
+            # Optionally set environment variables too
+            os.environ["SSH_PRIVATE_KEY"] = privkey_path
+            os.environ["SSH_PUBLIC_KEY"] = pubkey_path
+
+    def _is_ol9(self):
+        try:
+            with open("/etc/oracle-release", "r") as f:
+                content = f.read()
+                return "release 9" in content
+        except Exception:
+            return False
+
+    def configure_legacy_scp_for_19c(self):
+        """
+        Make scp compatible with Oracle 19c CVU/DBCA on Oracle Linux 8 and 9.
+
+        This runs only for Oracle major version 19.
+
+        Oracle 19c CVU/DBCA invokes scp with a remote path that includes literal
+        single quotes in the argv (for example,
+        host:'/var/tmp/.../getFileInfoNNN.out'). OpenSSH then fails with
+        "protocol error: filename does not match request", which surfaces as
+        PRVF-5311 / INS-06006 during TaskUserEquivalence.
+
+        On OL9, force legacy scp mode with -O -T.
+        On OL8, OpenSSH 8.0 supports -T but not -O; strip -O if present and
+        force -T so the CVU quoted-path copy succeeds.
+        """
+        try:
+            oraversion = self.ocommon.get_rsp_version("INSTALL", None)
+            version = oraversion.split(".", 1)[0].strip()
+        except Exception as ex:
+            self.ocommon.log_warn_message(
+                "Unable to determine Oracle version for legacy scp setup: {0}".format(ex),
+                self.file_name
+            )
+            return
+
+        if version != "19":
+            self.ocommon.log_info_message(
+                "Skipping legacy scp setup for Oracle major version {0}".format(version),
+                self.file_name
+            )
+            return
+
+        scp_bin = "/usr/bin/scp"
+        scp_orig = "/usr/bin/scp.openssh"
+
+        if not os.path.exists(scp_bin):
+            self.ocommon.log_warn_message(
+                "scp not found at {0}; skipping legacy scp setup".format(scp_bin),
+                self.file_name
+            )
+            return
+
+        if self._is_ol9():
+            wrapper_lines = [
+                "#!/bin/bash",
+                'exec /usr/bin/scp.openssh -O -T "$@"'
+            ]
+            wrapper_message = "Installed Oracle 19c OpenSSH scp wrapper at {0} for OL9".format(scp_bin)
+        else:
+            # Oracle Linux 8: keep -T (needed for CVU quoted remote paths) and
+            # drop unsupported -O before invoking the real scp binary.
+            wrapper_lines = [
+                "#!/bin/bash",
+                "args=()",
+                'for arg in "$@"; do',
+                '  case "$arg" in',
+                "    -O) ;;",
+                '    *) args+=("$arg") ;;',
+                "  esac",
+                "done",
+                'exec /usr/bin/scp.openssh -T "${args[@]}"'
+            ]
+            wrapper_message = "Installed Oracle 19c OpenSSH scp wrapper at {0} for OL8".format(scp_bin)
+
+        if os.path.exists(scp_orig):
+            # Refresh an existing wrapper so a prior incorrect OL8 install is corrected.
+            printf_args = " ".join("'{0}'".format(line) for line in wrapper_lines)
+            install_cmd = "printf '%s\\n' {0} > {1} && chmod 755 {1}".format(
+                printf_args, scp_bin
+            )
+            self.ocommon.execute_cmd_checked(install_cmd, None, None, exit_on_error=True)
+            self.ocommon.log_info_message(
+                "Refreshed Oracle 19c scp wrapper at {0}".format(scp_bin),
+                self.file_name
+            )
+            return
+
+        printf_args = " ".join("'{0}'".format(line) for line in wrapper_lines)
+        install_cmd = "mv {0} {1} && printf '%s\\n' {2} > {0} && chmod 755 {0} {1}".format(
+            scp_bin, scp_orig, printf_args
+        )
+        self.ocommon.execute_cmd_checked(install_cmd, None, None, exit_on_error=True)
+        self.ocommon.log_info_message(
+            wrapper_message,
+            self.file_name
+        )
+
+###### Install CRS Software on node ######
+    def crs_sw_install(self):
+       """
+       Perform CRS software install on all nodes.
+       """
+       giuser,gihome,gibase,oinv=self.ocommon.get_gi_params()
+       status=True
+       if not self.ocommon.check_key("GI_HOME_INSTALLED_FLAG",self.ora_env_dict):
+          status=self.ocommon.check_home_inv(None,gihome,giuser)
+       if not status and self.ocommon.check_key("COPY_GRID_SOFTWARE",self.ora_env_dict):
+          pub_nodes,vip_nodes,priv_nodes=self.ocommon.process_cluster_vars("CRS_NODES")
+          crs_nodes=pub_nodes.replace(" ",",")
+          osdba=self.ora_env_dict["OSDBA_GROUP"] if self.ocommon.check_key("OSDBA",self.ora_env_dict) else "asmdba"
+          osoper=self.ora_env_dict["OSPER_GROUP"] if self.ocommon.check_key("OSPER_GROUP",self.ora_env_dict) else "asmoper"
+          osasm=self.ora_env_dict["OSASM_GROUP"] if self.ocommon.check_key("OSASM_GROUP",self.ora_env_dict) else "asmadmin"
+          unixgrp="oinstall"
+          hostname=self.ocommon.get_public_hostname()
+          lang=self.ora_env_dict["LANGUAGE"] if self.ocommon.check_key("LANGUAGE",self.ora_env_dict) else "en"
+          node=hostname
+          copyflag=" -noCopy "
+          if not self.ocommon.check_key("COPY_GRID_SOFTWARE",self.ora_env_dict):
+             copyflag=" -noCopy "
+          oraversion=self.ocommon.get_rsp_version("INSTALL",None)
+          version=oraversion.split(".",1)[0].strip()
+       
+          #self.crs_sw_install_on_node(giuser,copyflag,crs_nodes,oinv,gihome,gibase,osdba,osoper,osasm,version,node)
+          self.ocommon.log_step("ENV", "crs_sw_install", "node", node, self.file_name)
+          self.ocommon.crs_sw_install_on_node(giuser,copyflag,crs_nodes,oinv,gihome,gibase,osdba,osoper,osasm,version,node)
+          self.ocommon.run_orainstsh_local(giuser,node,oinv)
+          self.ocommon.run_rootsh_local(gihome,giuser,node)
+          
+###### Setting up ssh for K8s #######
+    def populate_user_profiles(self):
+        """
+        Set up user profiles if the environment is K8s.
+        """
+        giuser,gihome,obase,invloc=self.ocommon.get_gi_params()
+        dbuser,dbhome,dbase,oinv=self.ocommon.get_db_params()
+        gipath='''{0}/perl/bin:{0}/bin:/bin:/usr/bin:/sbin:/usr/local/bin'''.format(gihome)
+        dbpath='''{0}/perl/bin:{0}/bin:/bin:/usr/bin:/sbin:/usr/local/bin'''.format(dbhome)
+        gildpath='''{0}/lib:/lib/:/usr/lib'''.format(gihome)
+        dbldpath='''{0}/lib:/lib/:/usr/lib'''.format(dbhome)
+        cdgihome='''cd {0}'''.format(gihome)
+        cddbhome='''cd {0}'''.format(dbhome)
+        cdgilogs='''cd {0}/diag/crs/*/crs/trace'''.format(obase)
+        cddblogs='''cd {0}/diag/rdbms/'''.format(dbase)
+        cdinvlogs='''cd {0}/logs'''.format(invloc)
+              
+        if not self.ocommon.check_key("PROFILE_FLAG",self.ora_env_dict):
+          self.ora_env_dict=self.ocommon.add_key("PROFILE_FLAG","TRUE",self.ora_env_dict) 
+ 
+        tmpdir=self.ocommon.get_tmpdir()
+        self.ocommon.set_user_profile(giuser,"TMPDIR",tmpdir,"export")
+        self.ocommon.set_user_profile(giuser,"TEMP",tmpdir,"export")
+        self.ocommon.set_user_profile(dbuser,"TMPDIR",tmpdir,"export")
+        self.ocommon.set_user_profile(dbuser,"TEMP",tmpdir,"export")
+        if self.ocommon.check_key("PROFILE_FLAG",self.ora_env_dict):
+           self.ocommon.set_user_profile(giuser,"ORACLE_HOME",gihome,"export")
+           self.ocommon.set_user_profile(giuser,"GRID_HOME",gihome,"export")
+           self.ocommon.set_user_profile(giuser,"PATH",gipath,"export")
+           self.ocommon.set_user_profile(giuser,"LD_LIBRARY_PATH",gildpath,"export")
+           self.ocommon.set_user_profile(dbuser,"ORACLE_HOME",dbhome,"export")
+           self.ocommon.set_user_profile(dbuser,"DB_HOME",dbhome,"export")
+           self.ocommon.set_user_profile(dbuser,"PATH",dbpath,"export")           
+           self.ocommon.set_user_profile(dbuser,"LD_LIBRARY_PATH",dbldpath,"export")
+           #### Setting alias
+           self.ocommon.set_user_profile(giuser,"cdgihome",cdgihome,"alias")
+           self.ocommon.set_user_profile(giuser,"cddbhome",cddbhome,"alias")
+           self.ocommon.set_user_profile(dbuser,"cddbhome",cddbhome,"alias")
+           self.ocommon.set_user_profile(giuser,"cdgilogs",cdgilogs,"alias")
+           self.ocommon.set_user_profile(dbuser,"cddblogs",cddblogs,"alias")
+           self.ocommon.set_user_profile(dbuser,"cdinvlogs",cdinvlogs,"alias")
+           self.ocommon.set_user_profile(giuser,"cdinvlogs",cdinvlogs,"alias")
+
+
+##### Set the banner ###
+    def set_banner(self):
+        """
+        This function set the banner
+        """
+        if self.ocommon.check_key("OP_TYPE",self.ora_env_dict):
+           if self.ocommon.check_key("GI_SW_UNZIPPED_FLAG",self.ora_env_dict) and self.ora_env_dict["OP_TYPE"] == 'nosetup':
+               msg="Since OP_TYPE is set to default value (nosetup), setup will be initiated by other nodes based on OP_TYPE"
+               self.ocommon.log_info_message(self.ocommon.print_banner(msg),self.file_name) 
+           elif self.ocommon.check_key("GI_SW_UNZIPPED_FLAG",self.ora_env_dict) and self.ora_env_dict["OP_TYPE"] != 'nosetup':
+               msg="Since OP_TYPE is set to " + self.ora_env_dict["OP_TYPE"] + ", setup will be initiated on this node"
+               self.ocommon.log_info_message(self.ocommon.print_banner(msg),self.file_name)                
+           else:
+              giuser,gihome,obase,invloc=self.ocommon.get_gi_params()
+              pubhostname = self.ocommon.get_public_hostname()
+              retcode1=self.ocvu.check_home(pubhostname,gihome,giuser)
+              if retcode1 == 0:
+                 self.ora_env_dict=self.ocommon.add_key("GI_HOME_INSTALLED_FLAG","true",self.ora_env_dict)
+              status=self.ocommon.check_gi_installed(retcode1,gihome,giuser,pubhostname,invloc)
+              if status:
+                 msg="Grid is already installed on this machine"
+                 self.ocommon.log_info_message(self.ocommon.print_banner(msg),self.file_name)
+                 self.ora_env_dict=self.ocommon.add_key("GI_HOME_CONFIGURED_FLAG","true",self.ora_env_dict)
+              else:
+                 msg="Grid is not installed on this machine"
+                 self.ocommon.log_info_message(self.ocommon.print_banner(msg),self.file_name)
+
+    def comment_out_swap_space(self):
+      """
+      This function comments out the SWAP_SPACE=500 parameter in oraparam.ini
+      file for:
+         - Oracle 19 always
+         - Oracle 23+ only if APPLY_RU_LOCATION is defined
+      in both GRID_HOME and DB_HOME.
+      """
+
+      oraversion = self.ocommon.get_rsp_version("INSTALL", None)
+      version = int(oraversion.split(".", 1)[0].strip())
+
+      # Get DB and GI homes
+      dbuser, dbhome, dbase, oinv = self.ocommon.get_db_params()
+      giuser, gihome, gibase, oinv = self.ocommon.get_gi_params()
+
+      # Determine whether to execute
+      should_execute = False
+
+      if version == 19:
+         should_execute = True
+      elif version >= 23:
+         if self.ocommon.check_key("APPLY_RU_LOCATION", self.ora_env_dict) or self.ocommon.check_key("ONEOFF_FOLDER_NAME", self.ora_env_dict):
+               should_execute = True
+
+      if not should_execute:
+         self.ocommon.log_info_message(
+               "Skipping commenting out SWAP_SPACE for Oracle version {}".format(version),
+               self.file_name
+         )
+         return
+
+      homes_to_check = [gihome, dbhome]
+      section_name = "[Generic Prereqs]"
+      param_name = "SWAP_SPACE=500"
+
+      for home in homes_to_check:
+         file_path = "{}/oui/oraparam.ini".format(home)
+
+         try:
+               with open(file_path, 'r') as file:
+                  lines = file.readlines()
+
+               in_section = False
+               modified_lines = []
+
+               for line in lines:
+                  if line.strip() == section_name:
+                     in_section = True
+                  elif line.startswith('[') and in_section:
+                     in_section = False
+
+                  if in_section and line.strip() == param_name:
+                     modified_lines.append("#{}".format(line))
+                  else:
+                     modified_lines.append(line)
+
+               with open(file_path, 'w') as file:
+                  file.writelines(modified_lines)
+
+               self.ocommon.log_info_message(
+                  "Successfully commented out {} in {}".format(param_name, file_path),
+                  self.file_name
+               )
+
+         except Exception as e:
+               self.ocommon.log_error_message(
+                  "Failed to comment out {} in {}: {}".format(param_name, file_path, str(e)),
+                  self.file_name
+               )
+ 
+    def wait_for_orasetupenv_completion(self, log_file_path):
+      """
+      Wait until 'Total time for orasetupenv setup' is printed in the log
+      on all CRS public nodes.
+      Runs ONLY on INSTALL_NODE.
+      """
+
+      # --------------------------------------------------
+      # Run only on INSTALL_NODE
+      # --------------------------------------------------
+      install_node = self.ora_env_dict["INSTALL_NODE"]
+      local_host = self.ocommon.get_public_hostname()
+
+      if local_host.lower() != install_node.lower():
+         self.ocommon.log_info_message(
+               "Not INSTALL_NODE ({}), skipping wait_for_orasetupenv_completion".format(
+                  local_host
+               ),
+               self.file_name
+         )
+         return True
+
+      timeout_minutes = int(self.ora_env_dict["ORASETUPENV_TIMEOUT_MINUTES"])
+      giuser = self.ora_env_dict["GRID_USER"]
+
+      # --------------------------------------------------
+      # Get CRS public nodes using existing helper
+      # --------------------------------------------------
+      pub_nodes, vip_nodes, priv_nodes = self.ocommon.process_cluster_vars("CRS_NODES")
+
+      # pub_nodes is space-separated → convert to list
+      crs_nodes = pub_nodes.replace(" ", ",").split(",")
+
+      self.ocommon.log_info_message(
+         "Waiting for orasetupenv completion on CRS nodes {} "
+         "(timeout={} minutes)".format(",".join(crs_nodes), timeout_minutes),
+         self.file_name
+      )
+
+      # Single-node cluster
+      if len(crs_nodes) == 1:
+         self.ocommon.log_info_message(
+               "Single node cluster detected, skipping orasetupenv wait",
+               self.file_name
+         )
+         return True
+
+      start_time = time.time()
+      timeout_seconds = timeout_minutes * 60
+      completed_nodes = set()
+      marker = "Total time for orasetupenv setup"
+
+      while True:
+         for node in crs_nodes:
+               if node in completed_nodes:
+                  continue
+               cmd = [
+                  "su", "-", giuser, "-c",
+                  "ssh -o ConnectTimeout=5 {} grep -q \"Total time for orasetupenv setup\" {}".format(
+                     node, log_file_path
+                  )
+               ]
+
+               output, error, retcode = self.ocommon.execute_cmd_noshell(cmd)
+               if retcode == 0:
+                  self.ocommon.log_info_message(
+                     "orasetupenv completed on node {}".format(node),
+                     self.file_name
+                  )
+                  completed_nodes.add(node)
+
+         if len(completed_nodes) == len(crs_nodes):
+               self.ocommon.log_info_message(
+                  "orasetupenv completed successfully on all CRS nodes",
+                  self.file_name
+               )
+               return True
+
+         if time.time() - start_time > timeout_seconds:
+               pending_nodes = set(crs_nodes) - completed_nodes
+               raise TimeoutError(
+                  "Timeout waiting for orasetupenv completion. Pending nodes: {}".format(
+                     ",".join(pending_nodes)
+                  )
+               )
+
+         time.sleep(10)
+    def finalize_orasetupenv(self, start_ts):
+      """
+      Final validation phase for orasetupenv.
+      - Waits for orasetupenv completion on all CRS nodes
+      - Performs a single SSH verification at the very end
+      """
+
+      ct = datetime.datetime.now()
+      totaltime = ct.timestamp() - start_ts
+
+      self.ocommon.log_info_message(
+         "Total time for orasetupenv setup() = [ {0} ] seconds"
+         .format(round(totaltime, 3)),
+         self.file_name
+      )
+      if self.ocommon.detect_k8s_env(): 
+         log_file = self.ora_env_dict.get("LOG_FILE_NAME")
+         if not log_file:
+            self.ocommon.log_error_message(
+                  "LOG_FILE_NAME is not set, cannot wait for orasetupenv completion",
+                  self.file_name
+            )
+            return False
+
+         # --------------------------------------------------
+         # Wait for orasetupenv completion (authoritative)
+         # --------------------------------------------------
+         if os.path.basename(log_file).startswith("oracle_db_setup") and os.path.basename(log_file).endswith(".log"):
+            self.wait_for_orasetupenv_completion(log_file)
+
+         # --------------------------------------------------
+         # Final SSH verification (single point of truth)
+         # --------------------------------------------------
+         giuser, gihome, _, _ = self.ocommon.get_gi_params()
+         version = self.ocommon.get_rsp_version("INSTALL", None).split(".", 1)[0]
+         nodes = self.ocommon.get_cluster_nodes()
+
+         rc = self.osetupssh.verifyssh(
+            giuser,
+            gihome,
+            "runcluvfy.sh",
+            nodes,
+            version
+         )
+
+         if rc != 0:
+            self.ocommon.log_error_message(
+                  "Final SSH verification failed after orasetupenv completion",
+                  self.file_name
+            )
+            return False
+
+         self.ocommon.log_info_message(
+            "Final SSH verification successful on all cluster nodes",
+            self.file_name
+         )
+         return True
+
+    def normalize_pod_public_mask(self):
+      """
+      Detect public interface dynamically using public hostname.
+      Remove incorrect /16 alias injected by flannel/CNI.
+      Works for any interface name (eth0, net1, ensX, etc).
+      """
+
+      if not self.ocommon.detect_k8s_env():
+         return True
+
+      import socket
+
+      pubhostname = self.ocommon.get_public_hostname()
+
+      try:
+         public_ip = socket.gethostbyname(pubhostname)
+      except Exception:
+         self.ocommon.log_info_message(
+               "Could not resolve public hostname {}".format(pubhostname),
+               self.file_name
+         )
+         return True
+
+      self.ocommon.log_info_message(
+         "Public hostname {} resolves to {}".format(pubhostname, public_ip),
+         self.file_name
+      )
+
+      
+      cmd = "/sbin/ip -o addr show | grep {}".format(public_ip)
+      out, err, rc = self.ocommon.execute_cmd(cmd, None, None)
+
+      if rc != 0 or not out:
+         self.ocommon.log_info_message(
+               "Could not detect public interface",
+               self.file_name
+         )
+         return True
+
+      iface = out.split()[1].split("@")[0]
+
+      self.ocommon.log_info_message(
+         "Detected public interface {}".format(iface),
+         self.file_name
+      )
+
+      cmd = "/sbin/ip -o -4 addr show dev {}".format(iface)
+      out, err, rc = self.ocommon.execute_cmd(cmd, None, None)
+
+      if rc != 0 or not out:
+         return True
+
+      removed = False
+
+      for line in out.splitlines():
+
+         parts = line.split()
+
+         cidr = None
+         for p in parts:
+               if "/" in p and "." in p:
+                  cidr = p.strip()
+                  break
+
+         if not cidr:
+               continue
+
+         self.ocommon.log_info_message(
+               "Found address {}".format(cidr),
+               self.file_name
+         )
+
+         # Skip the REAL public IP
+         if cidr.startswith(public_ip + "/"):
+               continue
+
+         # Remove only incorrect /16 aliases
+         if "/16" in cidr:
+
+               self.ocommon.log_info_message(
+                  "Removing incorrect alias {} from {}".format(cidr, iface),
+                  self.file_name
+               )
+
+               delcmd = "/sbin/ip addr del {} dev {}".format(cidr, iface)
+               self.ocommon.execute_cmd(delcmd, None, None)
+
+               removed = True
+
+      if removed:
+         self.ocommon.log_info_message(
+               "Public interface normalization complete",
+               self.file_name
+         )
+      else:
+         self.ocommon.log_info_message(
+               "No incorrect public aliases detected",
+               self.file_name
+         )
+
+      return True
